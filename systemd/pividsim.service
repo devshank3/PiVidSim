@@ -1,0 +1,40 @@
+# PiVidSim systemd service — installed to /etc/systemd/system/pividsim.service
+# by scripts/install.sh, which substitutes __REPO_DIR__ with the clone path.
+#
+# The service takes over virtual terminal 1 so mpv can own the DRM/KMS display,
+# and runs as root so it can mount USB drives and open /dev/dri directly. This
+# is a single-purpose appliance with no untrusted input, so root is acceptable.
+
+[Unit]
+Description=PiVidSim USB video autoplayer
+Documentation=https://github.com/devshank/PiVidSim
+# Start after the login/getty on tty1 is up, then take the console from it.
+After=systemd-user-sessions.service getty@tty1.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=__REPO_DIR__
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=__REPO_DIR__
+# --- Picture / decoding knobs (uncomment and tweak on-device) --------------
+# Environment=PIVIDSIM_MPV_VO=drm
+# Environment=PIVIDSIM_MPV_HWDEC=v4l2m2m-copy
+ExecStart=/usr/bin/python3 -m pividsim.main
+
+# Own tty1 so mpv's DRM output has the console to itself (no blinking cursor,
+# no getty fighting for the framebuffer).
+StandardInput=tty-force
+StandardOutput=journal
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+
+# Keep it alive no matter what; this is the only job the Pi has.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

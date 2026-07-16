@@ -18,9 +18,9 @@ import time
 from types import FrameType
 from typing import Optional
 
-from .config import SETTLE_SECONDS, WATCHDOG_INTERVAL
+from .config import MOUNT_ROOT, SETTLE_SECONDS, WATCHDOG_INTERVAL
 from .player import Mode, MpvProcess
-from .usb import UsbMonitor, build_playlist
+from .usb import MountManager, UsbMonitor, build_playlist
 
 log = logging.getLogger("pividsim")
 
@@ -41,10 +41,14 @@ def _drain(q: "queue.Queue[str]") -> None:
         return
 
 
-def _reconcile(player: MpvProcess) -> None:
+def _reconcile(player: MpvProcess, mounts: MountManager) -> None:
     """Match player state to the current set of USB videos."""
-    playlist = build_playlist()
-    log.info("Reconcile: %d video file(s) available", len(playlist))
+    mountpoints = mounts.sync()
+    playlist = build_playlist(mountpoints)
+    log.info(
+        "Reconcile: %d mount(s), %d video file(s) available",
+        len(mountpoints), len(playlist),
+    )
     if playlist:
         # Always restart on reconcile — cheap, and picks up added/removed files.
         player.start_playing(playlist)
@@ -59,8 +63,14 @@ def main() -> int:
     _configure_logging()
     log.info("PiVidSim starting")
 
+    try:
+        MOUNT_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error("Cannot create mount root %s: %s", MOUNT_ROOT, exc)
+
     events: "queue.Queue[str]" = queue.Queue(maxsize=64)
     monitor = UsbMonitor(events)
+    mounts = MountManager()
     player = MpvProcess()
     stopping = False
 
@@ -73,7 +83,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
 
     monitor.start()
-    _reconcile(player)
+    _reconcile(player, mounts)
 
     last_watchdog = time.monotonic()
     try:
@@ -83,7 +93,7 @@ def main() -> int:
                 # Coalesce a burst of events after the first arrival.
                 time.sleep(SETTLE_SECONDS)
                 _drain(events)
-                _reconcile(player)
+                _reconcile(player, mounts)
             except queue.Empty:
                 pass
 
@@ -99,6 +109,7 @@ def main() -> int:
     finally:
         monitor.stop()
         player.stop()
+        mounts.unmount_all()
         log.info("PiVidSim exited")
     return 0
 

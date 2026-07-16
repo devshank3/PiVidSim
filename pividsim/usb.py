@@ -1,47 +1,144 @@
-"""USB mount discovery and udev-based hot-plug monitoring."""
+"""USB discovery, self-mounting, and udev-based hot-plug monitoring.
+
+On Raspberry Pi OS Lite there is no desktop file manager to auto-mount
+removable drives, so PiVidSim mounts them itself (read-only) under
+``MOUNT_ROOT``. A background udev thread reports plug/unplug events; the main
+loop then calls :meth:`MountManager.sync` to reconcile mounts on demand.
+"""
 from __future__ import annotations
 
 import logging
 import queue
+import subprocess
 import threading
 from pathlib import Path
 from typing import Iterator
 
 import pyudev
 
-from .config import MOUNT_ROOT, USB_FS_TYPES, VIDEO_EXTENSIONS
+from .config import (
+    MOUNT_OPTIONS,
+    MOUNT_ROOT,
+    MOUNT_TIMEOUT,
+    USB_FS_TYPES,
+    VIDEO_EXTENSIONS,
+)
 
 log = logging.getLogger(__name__)
 
 
-def iter_current_usb_mounts() -> Iterator[Path]:
-    """Yield mount paths under MOUNT_ROOT that look like USB drives."""
-    try:
-        raw = Path("/proc/mounts").read_text()
-    except OSError as exc:
-        log.warning("Could not read /proc/mounts: %s", exc)
-        return
+def iter_usb_partitions() -> Iterator[tuple[str, str]]:
+    """Yield ``(device_node, fstype)`` for every mountable USB partition.
 
-    for line in raw.splitlines():
-        parts = line.split()
-        if len(parts) < 3:
+    Filters to genuine USB block partitions carrying a filesystem we support,
+    which naturally excludes the Pi's SD card (``mmcblk*``, bus ``mmc``).
+    """
+    context = pyudev.Context()
+    for dev in context.list_devices(subsystem="block", DEVTYPE="partition"):
+        if dev.get("ID_BUS") != "usb":
             continue
-        _dev, mountpoint, fstype = parts[0], parts[1], parts[2]
-        if fstype not in USB_FS_TYPES:
+        fstype = dev.get("ID_FS_TYPE")
+        node = dev.device_node
+        if not node or fstype not in USB_FS_TYPES:
             continue
+        yield node, fstype
 
-        # /proc/mounts encodes spaces/tabs as octal escapes (\040, \011...).
+
+class MountManager:
+    """Owns read-only mounts of USB partitions under ``MOUNT_ROOT``.
+
+    :meth:`sync` is idempotent: it mounts partitions that appeared and unmounts
+    those that vanished, returning the set of currently mounted paths. This
+    matches the "rescan on any event" philosophy of the main loop.
+    """
+
+    def __init__(self) -> None:
+        # device_node -> mountpoint
+        self._mounts: dict[str, Path] = {}
+
+    def sync(self) -> list[Path]:
+        """Reconcile mounts with the set of present USB partitions."""
+        present = dict(iter_usb_partitions())  # node -> fstype
+
+        # Unmount anything that disappeared.
+        for node in list(self._mounts):
+            if node not in present:
+                self._unmount(node)
+
+        # Mount anything new.
+        for node, fstype in present.items():
+            if node not in self._mounts:
+                self._mount(node, fstype)
+
+        return list(self._mounts.values())
+
+    def unmount_all(self) -> None:
+        """Tear down every mount we created (used on shutdown)."""
+        for node in list(self._mounts):
+            self._unmount(node)
+
+    # --- Internals ----------------------------------------------------------
+
+    def _mount(self, node: str, fstype: str) -> None:
+        # Derive a stable, filesystem-safe mountpoint name from the node.
+        name = node.replace("/", "_").lstrip("_")
+        mountpoint = MOUNT_ROOT / name
         try:
-            mp = mountpoint.encode("latin-1").decode("unicode_escape")
-        except UnicodeDecodeError:
-            mp = mountpoint
+            mountpoint.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.error("Cannot create mountpoint %s: %s", mountpoint, exc)
+            return
 
-        mp_path = Path(mp)
+        cmd = [
+            "mount",
+            "-t", fstype,
+            "-o", MOUNT_OPTIONS,
+            node, str(mountpoint),
+        ]
         try:
-            mp_path.relative_to(MOUNT_ROOT)
-        except ValueError:
-            continue
-        yield mp_path
+            subprocess.run(
+                cmd, check=True, capture_output=True, text=True,
+                timeout=MOUNT_TIMEOUT,
+            )
+        except FileNotFoundError:
+            log.error("'mount' not found; cannot mount %s", node)
+            return
+        except subprocess.TimeoutExpired:
+            log.error("Timed out mounting %s", node)
+            return
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            log.error("Failed to mount %s (%s): %s", node, fstype, stderr)
+            self._rmdir(mountpoint)
+            return
+
+        self._mounts[node] = mountpoint
+        log.info("Mounted %s (%s, ro) at %s", node, fstype, mountpoint)
+
+    def _unmount(self, node: str) -> None:
+        mountpoint = self._mounts.pop(node, None)
+        if mountpoint is None:
+            return
+        # Lazy unmount: the device may already be physically gone.
+        try:
+            subprocess.run(
+                ["umount", "-l", str(mountpoint)],
+                check=False, capture_output=True, text=True,
+                timeout=MOUNT_TIMEOUT,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            log.warning("Error unmounting %s: %s", mountpoint, exc)
+        else:
+            log.info("Unmounted %s (%s)", mountpoint, node)
+        self._rmdir(mountpoint)
+
+    @staticmethod
+    def _rmdir(mountpoint: Path) -> None:
+        try:
+            mountpoint.rmdir()
+        except OSError:
+            # Non-empty (still mounted) or already gone — leave it be.
+            pass
 
 
 def list_videos(mount: Path) -> list[Path]:
@@ -65,10 +162,10 @@ def list_videos(mount: Path) -> list[Path]:
     return found
 
 
-def build_playlist() -> list[Path]:
-    """Sorted union of videos across all currently mounted USB drives."""
+def build_playlist(mounts: list[Path]) -> list[Path]:
+    """Sorted union of videos across the given (already mounted) USB paths."""
     all_videos: list[Path] = []
-    for mount in iter_current_usb_mounts():
+    for mount in mounts:
         vids = list_videos(mount)
         log.info("Mount %s: %d video(s)", mount, len(vids))
         all_videos.extend(vids)
